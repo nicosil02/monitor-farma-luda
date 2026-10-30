@@ -37,7 +37,7 @@ FUENTES: list[dict] = [
     gn("ES", "mencion", "LUDA (ES)", '"LUDA Partners" OR "LUDA Trends" OR "LUDA Farma"'),
     gn("ES", "mencion", "LUDA farmacia (ES)", "LUDA farmacia OR farmacias OR desabastecimiento"),
     gn("ES", "mencion", "Voceros LUDA", '"Daniel de Carvajal" OR ("Luis Martín" LUDA)'),
-    *[gn("GLOBAL", "mencion", f"LUDA ({i})", '"LUDA Partners"', i) for i in ("en", "fr", "it", "pt", "de")],
+    *[gn("GLOBAL", "mencion", f"LUDA ({i})", '"LUDA Partners"', i) for i in ("en",)],
 
     # --- Oficiales ES ---
     rss("ES", "oficial", "AEMPS", "https://www.aemps.gob.es/feed/"),
@@ -117,7 +117,6 @@ FUENTES: list[dict] = [
     rss("EU", "sector", "PharmaTimes", "https://pharmatimes.com/feed/", True),
     rss("EU", "sector", "Endpoints", "https://endpts.com/feed/", True),
     rss("EU", "sector", "Health Policy Watch", "https://healthpolicy-watch.news/feed/", True),
-    rss("EU", "sector", "Le Quotidien du Pharmacien", "https://www.lequotidiendupharmacien.fr/rss.xml", True),
     gn("EU", "sector", "Euractiv Health", "site:euractiv.com medicines OR pharmacy OR shortages", "en"),
     gn("EU", "sector", "Politico EU Health", "site:politico.eu medicines OR pharmaceutical", "en"),
     gn("EU", "sector", "Pharmaceutical Journal", "site:pharmaceutical-journal.com", "en"),
@@ -125,8 +124,4 @@ FUENTES: list[dict] = [
     gn("EU", "tema", "Critical Medicines Act", '"Critical Medicines Act"', "en"),
     gn("EU", "tema", "EU pharma package", '"pharmaceutical package" OR "pharmaceutical legislation" EU', "en"),
     gn("EU", "tema", "Online pharmacy EU", '"online pharmacy" Europe OR "e-pharmacy" Europe', "en"),
-    gn("EU", "tema", "Pénuries (FR)", '"pénurie de médicaments" OR "ruptures de stock" pharmacie', "fr"),
-    gn("EU", "tema", "Lieferengpässe (DE)", "Lieferengpässe Arzneimittel OR Apotheke", "de"),
-    gn("EU", "tema", "Carenza farmaci (IT)", '"carenza farmaci" OR "carenza di farmaci"', "it"),
-    gn("EU", "tema", "Falta medicamentos (PT)", '"falta de medicamentos" OR "rutura de medicamentos" farmácias', "pt"),
 ]

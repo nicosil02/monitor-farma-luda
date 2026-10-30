@@ -471,9 +471,9 @@ def _mencion(n: dict) -> str:
     det = [x for x in (r.get("rol") and f"LUDA: {r['rol']}", r.get("riesgo") and f"riesgo {r['riesgo']}") if x]
     if r.get("verificada") is None:
         det.append("no se pudo leer la nota, verificar")
-    lineas = [f"{TONO_ICONO.get(r.get('tono'), '❔')} <b>{esc(n['medio'])}</b>"
-              + (f" · <i>{esc(' · '.join(det))}</i>" if det else ""),
-              f"<a href=\"{esc(url)}\">{esc(n['titulo'])}</a>"]
+    lineas = [f"<b><a href=\"{esc(url)}\">{esc(n['titulo'])}</a></b>",
+              f"{TONO_ICONO.get(r.get('tono'), '❔')} {esc(n['medio'])}"
+              + (f" · <i>{esc(' · '.join(det))}</i>" if det else "")]
     if r.get("resumen"):
         lineas.append(esc(r["resumen"]))
     if r.get("cita"):
@@ -626,7 +626,7 @@ def _linea(grupo: list[dict]) -> str:
     medios = sorted({g["medio"] for g in grupo})
     fuente = f"{len(medios)} medios: {', '.join(medios[:4])}{' …' if len(medios) > 4 else ''}" \
         if len(medios) > 1 else medios[0]
-    lineas = [f"📰 <b>{esc(fuente)}</b>", f"<a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a>"]
+    lineas = [f"<b><a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a></b>", f"📰 {esc(fuente)}"]
     # el resumen de cualquier nota del grupo que lo tenga
     resumen = next((g.get("extracto") for g in grupo if g.get("extracto")), "")
     if resumen:
