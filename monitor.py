@@ -310,6 +310,19 @@ def aemps(filas: list[dict] | None = None, hoy: str | None = None) -> tuple[int,
     return nuevos, len(resueltos)
 
 
+CIMA_LISTA = "https://cima.aemps.es/cima/publico/listadesabastecimiento.html"
+
+
+def ficha_cima(cn: str) -> str:
+    """Ficha del medicamento en CIMA (trae la seccion de problemas de
+    suministro). La ficha va por n. de registro, no por CN: se busca en la API."""
+    try:
+        nreg = requests.get(f"https://cima.aemps.es/cima/rest/medicamento?cn={cn}", timeout=15).json()["nregistro"]
+        return f"https://cima.aemps.es/cima/publico/detalle.html?nregistro={nreg}"
+    except Exception:
+        return CIMA_LISTA
+
+
 # ---------------------------------------------------------------- agrupado
 
 # Embeddings multilingues de Hugging Face (local, ~470 MB, CPU ~5 s para 280
@@ -675,12 +688,13 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
         if gs:
             lineas += [f"<b>{ICONO[sec]} {sec.upper()}</b>", "", *map(_linea, gs), ""]
 
-    nuevos = c.execute("SELECT nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
-    resueltos = c.execute("SELECT nombre FROM aemps WHERE resuelto_en=?", (hoy,)).fetchall()
+    nuevos = c.execute("SELECT cn, nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
+    resueltos = c.execute("SELECT cn, nombre FROM aemps WHERE resuelto_en=?", (hoy,)).fetchall()
     if nuevos or resueltos:
-        lineas.append(f"<b>🏛️ AEMPS: {len(nuevos)} nuevos problemas de suministro, {len(resueltos)} resueltos</b>")
-        lineas += [f"🔴 {esc(r['nombre'])}" for r in nuevos[:MAX_POR_SECCION]]
-        lineas += [f"🟢 {esc(r['nombre'])}" for r in resueltos[:MAX_POR_SECCION]]
+        lineas += [f"<b>🏛️ AEMPS: {len(nuevos)} nuevos problemas de suministro, {len(resueltos)} resueltos</b>",
+                   f"<a href=\"{CIMA_LISTA}\">Listado completo en CIMA</a>", ""]
+        lineas += [f"🔴 <a href=\"{ficha_cima(r['cn'])}\">{esc(r['nombre'])}</a>" for r in nuevos[:MAX_POR_SECCION]]
+        lineas += [f"🟢 <a href=\"{ficha_cima(r['cn'])}\">{esc(r['nombre'])}</a>" for r in resueltos[:MAX_POR_SECCION]]
 
     texto = "\n".join(lineas)
     out = ROOT / "reportes" / f"{hoy}.html"
