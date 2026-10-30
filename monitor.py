@@ -421,7 +421,7 @@ def correo(asunto: str, texto: str) -> bool:
     if os.environ.get("EMAIL_CC"):
         msg["Cc"] = os.environ["EMAIL_CC"]
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
-        s.login(user, clave)
+        s.login(user, clave.replace(" ", ""))   # Google la muestra en 4 grupos con espacios
         s.send_message(msg)
     print(f"correo: enviado a {para}")
     return True
