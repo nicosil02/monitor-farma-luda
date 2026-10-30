@@ -120,14 +120,20 @@ TEMAS: dict[str, list[str]] = {
         "roturas de stock", "medicamentos en falta", "suministro de medicamento", "sin alternativa terapeutica",
         "shortage", "penurie", "rupture de stock", "ruptures de stock", "lieferengpass",
         "lieferengpasse", "carenza", "carenze", "rutura de medicamento"],
-    "Farmacia y distribución": [
-        # sin "farmaceutico/a" suelto: es la persona ("el farmaceutico que
-        # ayudo en el accidente") o la industria, no la botica
-        "farmacia", "oficina de farmacia", "botica", "colegio de farmaceuticos", "cgcof",
-        "sefac", "fefe", "parafarmacia", "receta electronica", "dispensacion", "fedifar",
+    # El negocio de la farmacia (clientes de LUDA), no la palabra "farmacia":
+    # con "farmacia" suelta entraban "Gripe y vacunas: consulta en tu
+    # farmacia" o "Citricos - Farmacia y Nutricion" (2026-10-30).
+    "Farmacia comunitaria": [
+        "farmacia comunitaria", "farmacias comunitarias", "oficina de farmacia", "oficinas de farmacia",
+        "farmacia rural", "farmacias rurales", "cierre de farmacias", "apertura de farmacias",
+        "titulares de farmacia", "farmaceuticos comunitarios", "colegio de farmaceuticos",
+        "colegio oficial de farmaceuticos", "colegios de farmaceuticos", "consejo general de colegios",
+        "cgcof", "sefac", "fefe", "parafarmacia", "receta electronica", "dispensacion", "fedifar",
         "distribucion farmaceutica", "venta online de medicamentos", "venta a distancia",
-        "farmacia online", "pharmacy", "pharmacies", "pharmacist", "pharmacie",
-        "pharmacien", "apotheke", "farmacie", "farmacisti", "farmacias"],
+        "farmacia online", "farmacias online", "farmacia digital", "digitalizacion de la farmacia",
+        "servicios profesionales farmaceuticos", "guardias de farmacia",
+        "online pharmacy", "online pharmacies", "e-pharmacy", "community pharmacy",
+        "community pharmacies", "versandapotheke", "pharmacie en ligne"],
     "Regulación": [
         "aemps", "ley del medicamento", "ley de los medicamentos", "ley de garantias",
         "precios de referencia", "precio de referencia", "financiacion de medicamentos",
@@ -152,7 +158,9 @@ _RUIDO = re.compile(r"\bjobs? with\b|\bvacanc|proceso selectivo|concurso-oposici
                     r"|libre designacion|\bse nombra\b|\bbolsa de empleo"
                     r"|\bpapa\b|leon xiv|vatican|pontific|condolencia|profundo pesar|pesame|\bluto\b"
                     r"|accidente (?:ferroviario|de tren|de trafico)|\burda\b"
-                    r"|sesion formativa|edicion de tarde|aula dispensacion|webinar|curso online|jornada formativa",
+                    r"|sesion formativa|edicion de tarde|aula dispensacion|webinar|curso online|jornada formativa"
+                    # retiradas de cosmeticos (AEMPS) y NHS britanico / empleo UK
+                    r"|cosmetic|blanqueador|\bnhs\b|\bassessor\b|\bclosed on\b",
                     re.I)
 # Google News con gl=ES igual trae medios de LatAm: por dominio, y por
 # palabras en el titular para los .com latinoamericanos.
@@ -377,12 +385,14 @@ def telegram(texto: str) -> bool:
     if not (token and chat):
         print("telegram: falta TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID en .env, no se envia")
         return False
-    trozos, actual = [], ""
+    # No cortar dentro de un <blockquote>: Telegram rechaza HTML sin cerrar.
+    trozos, actual, dentro = [], "", False
     for linea in texto.split("\n"):
-        if len(actual) + len(linea) > 3900:
+        if len(actual) + len(linea) > 3900 and not dentro:
             trozos.append(actual)
             actual = ""
         actual += linea + "\n"
+        dentro = actual.count("<blockquote>") > actual.count("</blockquote>")
     trozos.append(actual)
     ok = True
     for t in filter(str.strip, trozos):
@@ -431,19 +441,20 @@ def _con_reputacion(c: sqlite3.Connection, notas: list[dict]) -> list[dict]:
 
 def _mencion(n: dict) -> str:
     r = n.get("rep") or {}
+    """Recuadro (blockquote de Telegram): que se distinga a simple vista del
+    resto de noticias."""
     url = r.get("url_real") or n["url"]
-    lineas = [f"{TONO_ICONO.get(r.get('tono'), '❔')} <a href=\"{esc(url)}\">{esc(n['titulo'])}</a>"
-              f" — {esc(n['medio'])}"]
     det = [x for x in (r.get("rol") and f"LUDA: {r['rol']}", r.get("riesgo") and f"riesgo {r['riesgo']}") if x]
     if r.get("verificada") is None:
         det.append("no se pudo leer la nota, verificar")
-    if det:
-        lineas.append(f"   <i>{esc(' · '.join(det))}</i>")
+    lineas = [f"{TONO_ICONO.get(r.get('tono'), '❔')} <b>{esc(n['medio'])}</b>"
+              + (f" · <i>{esc(' · '.join(det))}</i>" if det else ""),
+              f"<a href=\"{esc(url)}\">{esc(n['titulo'])}</a>"]
     if r.get("resumen"):
-        lineas.append(f"   {esc(r['resumen'])}")
+        lineas.append(esc(r["resumen"]))
     if r.get("cita"):
-        lineas.append(f"   «{esc(r['cita'][:220])}»")
-    return "\n".join(lineas)
+        lineas.append(f"<i>«{esc(r['cita'][:220])}»</i>")
+    return "<blockquote>" + "\n".join(lineas) + "</blockquote>"
 
 
 def _menciones(notas: list[dict]) -> list[str]:
@@ -455,7 +466,7 @@ def _menciones(notas: list[dict]) -> list[str]:
     out = [_mencion(n) for n in notas if n not in ola]
     if ola:
         links = ", ".join(f"<a href=\"{esc(rep(n).get('url_real') or n['url'])}\">{esc(n['medio'])}</a>" for n in ola)
-        out.append(f"📊 Citada como fuente de datos en {len(ola)} nota(s): {links}")
+        out.append(f"<blockquote>📊 <b>Citada como fuente de datos en {len(ola)} nota(s)</b>\n{links}</blockquote>")
     return out
 
 
@@ -472,8 +483,8 @@ def alertas() -> None:
         return
     urgente = any((n.get("rep") or {}).get("riesgo") == "alto" or (n.get("rep") or {}).get("tono") == "negativo"
                   for n in nuevas)
-    texto = (f"<b>{'🚨 ' if urgente else '📣 '}LUDA en prensa: {len(nuevas)} mención(es) nueva(s)</b>\n\n"
-             + "\n\n".join(_menciones(nuevas)))
+    texto = (f"<b>{'🚨' if urgente else '🔔'} LUDA EN LOS MEDIOS — {len(nuevas)} mención(es) nueva(s)</b>\n\n"
+             + "\n".join(_menciones(nuevas)))
     if telegram(texto):
         c.executemany("UPDATE reputacion SET enviada=1 WHERE url=?", [(n["url"],) for n in nuevas])
         c.commit()
@@ -482,10 +493,12 @@ def alertas() -> None:
 
 # ---------------------------------------------------------------- digest
 
-ORDEN = ["Mención LUDA", "Competencia y socios", "Desabastecimiento", "Farmacia y distribución",
-         "Regulación", "Europa", "Sanidad general"]
-ICONO = {"Mención LUDA": "📣", "Competencia y socios": "🏁", "Desabastecimiento": "💊",
-         "Farmacia y distribución": "🏪", "Regulación": "⚖️", "Europa": "🇪🇺", "Sanidad general": "🩺"}
+# Orden por cercania al negocio de LUDA. "Sanidad general" (estudios
+# clinicos, hospitales) se clasifica pero no va al resumen: no le sirve.
+ORDEN = ["Desabastecimiento", "Competencia y socios", "Regulación", "Farmacia comunitaria", "Europa"]
+ICONO = {"Competencia y socios": "🏁", "Desabastecimiento": "💊",
+         "Farmacia comunitaria": "🏪", "Regulación": "⚖️", "Europa": "🇪🇺"}
+TOPE = {"Europa": 4}   # España primero; Europa solo lo grueso
 
 
 def _notas(c: sqlite3.Connection, horas: int) -> list[dict]:
@@ -501,7 +514,11 @@ def _notas(c: sqlite3.Connection, horas: int) -> list[dict]:
         if clave in vistos:
             continue
         vistos.add(clave)
-        r["temas"] = temas(f"{r['titulo']} {r['resumen'] or ''}")
+        # El "resumen" de Google News es titular + nombre del medio: con el
+        # nombre "Consejo General de Colegios Farmaceuticos" sus notas de
+        # divulgacion (Finerenona, cambio de hora) caian en Farmacia.
+        gn = "news.google.com" in r["url"]
+        r["temas"] = temas(r["titulo"] if gn else f"{r['titulo']} {r['resumen'] or ''}")
         r["seccion"] = seccion(r)
         if r["seccion"]:
             out.append(r)
@@ -522,32 +539,32 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
     _evaluar_pendientes(c, notas)
     notas = _con_reputacion(c, notas)
     hoy = datetime.now().date().isoformat()
-    lineas = [f"<b>Monitor de medios LUDA — {hoy}</b>", ""]
 
-    # Reputacion: tono de las menciones de los ultimos DIAS_OLA dias
+    # 1) LUDA en los medios: mensaje propio, primero, con recuadros
     desde_ola = (datetime.now(timezone.utc) - timedelta(days=DIAS_OLA)).strftime("%Y-%m-%dT%H:%M:%SZ")
     tonos = c.execute("""SELECT r.tono, COUNT(*) FROM reputacion r JOIN noticias n ON n.url = r.url
                          WHERE r.verificada IS NOT 0 AND n.fecha_pub >= ? GROUP BY r.tono""",
                       (desde_ola,)).fetchall()
+    menciones = _menciones([n for n in notas if n["seccion"] == "Mención LUDA"])
+    balance = (f"<i>Últimos {DIAS_OLA} días: "
+               + " · ".join(f"{TONO_ICONO.get(t, '❔')} {k} {t}" for t, k in tonos) + "</i>") if tonos else ""
+    msg_luda = "\n".join([f"<b>🔔 LUDA EN LOS MEDIOS — {hoy}</b>", balance, ""] + menciones) if menciones else ""
 
+    # 2) El sector
+    lineas = [f"<b>📰 Monitor farma España — {hoy}</b>"]
+    lineas += [""] if menciones else [f"🔕 Hoy sin menciones de LUDA. {balance}", ""]
     for sec in ORDEN:
         notas_sec = [n for n in notas if n["seccion"] == sec]
-        if not notas_sec and sec != "Mención LUDA":
+        if not notas_sec:
             continue
         lineas.append(f"<b>{ICONO[sec]} {sec}</b>")
-        if sec == "Mención LUDA":
-            if tonos:
-                lineas.append(f"<i>Últimos {DIAS_OLA} días: "
-                              + " · ".join(f"{TONO_ICONO.get(t, '❔')} {k} {t}" for t, k in tonos) + "</i>")
-            lineas += _menciones(notas_sec) or ["Sin menciones nuevas."]
-            lineas.append("")
-            continue
         textos = [f"{n['titulo']} {n['resumen'] or ''}" for n in notas_sec]
         grupos: dict[int, list[dict]] = {}
         for n, g in zip(notas_sec, agrupar(textos)):
             grupos.setdefault(g, []).append(n)
         # Las historias con mas medios primero
-        lineas += [_linea(g) for g in sorted(grupos.values(), key=len, reverse=True)[:MAX_POR_SECCION]]
+        tope = TOPE.get(sec, MAX_POR_SECCION)
+        lineas += [_linea(g) for g in sorted(grupos.values(), key=len, reverse=True)[:tope]]
         lineas.append("")
 
     nuevos = c.execute("SELECT nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
@@ -561,8 +578,8 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
     out = ROOT / "reportes" / f"{hoy}.html"
     out.parent.mkdir(exist_ok=True)
     out.write_text('<meta charset="utf-8"><body style="white-space:pre-wrap;font-family:sans-serif">'
-                   + texto, encoding="utf-8")
-    if enviar and telegram(texto):
+                   + msg_luda + "\n\n" + texto, encoding="utf-8")
+    if enviar and (not msg_luda or telegram(msg_luda)) and telegram(texto):
         c.execute("UPDATE reputacion SET enviada=1 WHERE enviada=0")  # ya salieron en el digest
         c.commit()
     print(f"digest: {len(notas)} notas -> {out}")

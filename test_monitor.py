@@ -21,8 +21,24 @@ def test_separar_medio():
 
 
 def test_temas_y_seccion():
-    assert monitor.temas("Más de 850 medicamentos con problemas de suministro en farmacias")[:2] == \
-        ["Desabastecimiento", "Farmacia y distribución"]
+    assert monitor.temas("Más de 850 medicamentos con problemas de suministro en farmacias")[0] == "Desabastecimiento"
+    # "farmacia" suelta ya no es tema; el negocio de la farmacia si
+    assert "Farmacia comunitaria" not in monitor.temas("Gripe y vacunas: las dudas que puedes consultar en tu farmacia")
+    assert "Farmacia comunitaria" in monitor.temas("Los colegios de farmacéuticos piden ayudas para la farmacia rural")
+    assert monitor.seccion({"bloque": "oficial", "region": "ES", "filtro": 0, "temas": ["Regulación"],
+                            "titulo": "Aemps retira un blanqueador dental de venta en Temu"}) is None
+
+
+def test_telegram_no_corta_recuadros(monkeypatch):
+    enviados = []
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
+    monkeypatch.setattr(monitor.requests, "post",
+                        lambda url, data, timeout: enviados.append(data["text"]) or type("R", (), {"ok": True})())
+    bloque = "<blockquote>" + "\n".join(["linea " * 60] * 4) + "</blockquote>"
+    assert monitor.telegram("\n".join([bloque] * 6))
+    assert len(enviados) > 1
+    assert all(t.count("<blockquote>") == t.count("</blockquote>") for t in enviados)
     assert monitor.temas("Lieferengpässe bei Arzneimitteln")[0] == "Desabastecimiento"
     assert monitor.temas("La industria farmacéutica invierte en I+D") == ["Sanidad general"]
     assert monitor.temas("Nueva herramienta de IA para bancos") == []
@@ -32,11 +48,11 @@ def test_temas_y_seccion():
     assert monitor.seccion({**base, "region": "GLOBAL", "bloque": "tema", "temas": ["Desabastecimiento"]}) is None
     assert monitor.seccion({**base, "region": "GLOBAL", "bloque": "mencion", "temas": []}) == "Mención LUDA"
     # ruido de la primera corrida real
-    farma = {**base, "filtro": 0, "temas": ["Farmacia y distribución"]}
+    farma = {**base, "filtro": 0, "temas": ["Farmacia comunitaria"]}
     assert monitor.seccion({**farma, "titulo": "Reforma de la Ley de Farmacias en Mendoza"}) is None
     assert monitor.seccion({**farma, "titulo": "Farmacia rural", "dominio": "diario.com.mx"}) is None
     assert monitor.seccion({**farma, "titulo": "Pharmacist job with CV-Library"}) is None
-    assert monitor.seccion({**farma, "titulo": "Las farmacias de Baleares sin Loniten"}) == "Farmacia y distribución"
+    assert monitor.seccion({**farma, "titulo": "Las farmacias de Baleares sin Loniten"}) == "Farmacia comunitaria"
     assert monitor.seccion({**base, "region": "EU", "titulo": "Lilly cash-pay", "temas": ["Sanidad general"]}) is None
     assert monitor.temas("El farmacéutico que ayudó en el accidente") == []
 
@@ -64,15 +80,15 @@ def test_agrupar_por_cualquier_miembro():
 
 
 def test_ruido_institucional_fuera():
-    base = {"bloque": "sector", "region": "ES", "filtro": 0, "temas": ["Farmacia y distribución"]}
+    base = {"bloque": "sector", "region": "ES", "filtro": 0, "temas": ["Farmacia comunitaria"]}
     for t in ["La PGEU traslada a León XIV el compromiso de la farmacia",
               "El Colegio de Farmacéuticos traslada su profundo pesar por el accidente de Urda",
               "NUEVA EDICIÓN DE TARDE. AULA DISPENSACIÓN: RECETA ELECTRÓNICA"]:
         assert monitor.seccion({**base, "titulo": t}) is None, t
     assert monitor.seccion({**base, "titulo": "Colegio registra denuncias", "dominio": "www.teletica.com"}) is None
     # "a pesar de" y muertes por falta de farmacos si van
-    assert monitor.seccion({**base, "titulo": "Las farmacias abren a pesar de la huelga"}) == "Farmacia y distribución"
-    assert monitor.seccion({**base, "titulo": "Muere un paciente sin su fármaco en una farmacia"}) == "Farmacia y distribución"
+    assert monitor.seccion({**base, "titulo": "Las farmacias abren a pesar de la huelga"}) == "Farmacia comunitaria"
+    assert monitor.seccion({**base, "titulo": "Muere un paciente sin su fármaco en una farmacia"}) == "Farmacia comunitaria"
 
 
 def test_tono_es_para_luda_no_para_la_noticia():
