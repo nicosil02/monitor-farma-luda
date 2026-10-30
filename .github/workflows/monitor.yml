@@ -2,10 +2,11 @@ name: Monitor LUDA
 
 on:
   schedule:
-    # Una vez al dia, 06 UTC (07 Madrid invierno, 08 verano): resumen por
-    # Telegram + LUDA en los medios por correo. Antes habia alertas cada 2 h;
-    # se pidio cada 24 h (2026-10-30).
-    - cron: '0 6 * * *'
+    # Una vez al dia: resumen por Telegram + LUDA en los medios por correo.
+    # 03:17 UTC (04:17 Madrid invierno): GitHub atrasa el cron en horas punta
+    # (el de 06:00 salio a las 11:49 el 2026-10-30); minuto raro y margen de
+    # sobra para que llegue antes de empezar el dia en Madrid.
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       sin_correo:
