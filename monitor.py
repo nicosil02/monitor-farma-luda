@@ -224,6 +224,7 @@ def conectar() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS aemps (
             cn TEXT PRIMARY KEY, nombre TEXT, tipo INTEGER, fini TEXT, ffin TEXT, observ TEXT,
             activo INTEGER, visto_desde TEXT, resuelto_en TEXT);
+        CREATE TABLE IF NOT EXISTS extractos (url TEXT PRIMARY KEY, texto TEXT);
         CREATE TABLE IF NOT EXISTS reputacion (
             url TEXT PRIMARY KEY, url_real TEXT, verificada INTEGER, tono TEXT, rol TEXT,
             riesgo TEXT, resumen TEXT, cita TEXT, enviada INTEGER DEFAULT 0,
@@ -405,6 +406,27 @@ def telegram(texto: str) -> bool:
     return ok
 
 
+def correo(asunto: str, texto: str) -> bool:
+    """Mismo HTML que Telegram, por SMTP de Gmail (patron de monitor-avisos/
+    daily/send_email.py: con cuenta real Google firma el correo, sin dominio
+    propio). GMAIL_APP_PASSWORD es la contrasena de aplicacion, no la normal."""
+    import smtplib
+    from email.mime.text import MIMEText
+    user, clave, para = (os.environ.get(k) for k in ("GMAIL_USER", "GMAIL_APP_PASSWORD", "EMAIL_TO"))
+    if not (user and clave and para):
+        print("correo: falta GMAIL_USER/GMAIL_APP_PASSWORD/EMAIL_TO, no se envia")
+        return False
+    msg = MIMEText(f'<div style="white-space:pre-wrap;font-family:sans-serif">{texto}</div>', "html", "utf-8")
+    msg["Subject"], msg["From"], msg["To"] = asunto, f"Monitor LUDA <{user}>", para
+    if os.environ.get("EMAIL_CC"):
+        msg["Cc"] = os.environ["EMAIL_CC"]
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as s:
+        s.login(user, clave)
+        s.send_message(msg)
+    print(f"correo: enviado a {para}")
+    return True
+
+
 # ---------------------------------------------------------------- reputacion
 
 TONO_ICONO = {"positivo": "🟢", "neutro": "⚪", "negativo": "🔴", "sin evaluar": "❔"}
@@ -525,12 +547,84 @@ def _notas(c: sqlite3.Connection, horas: int) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------- resumen de cada nota
+
+# Entradilla escrita por el propio medio (og:description o meta description),
+# no un resumen generado: no inventa datos. Probado 2026-10-30 con notas
+# reales: Sandoz, Hefame, convenio FEFE, Critical Medicines Act salen bien;
+# ~1 de 4 no trae entradilla y va sin resumen.
+_META_DESC = [re.compile(p, re.I | re.S) for p in (
+    r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description',
+    r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)')]
+# Paginas de error/bloqueo que se cuelan como "primer parrafo" (Akamai en MarketScreener)
+_BASURA = re.compile(r"reference #|edgesuite|access denied|cookies|javascript|suscri"
+                     r"|google news|aggregated from sources|nel play rsi", re.I)
+LARGO_RESUMEN = 230
+
+
+def _corto(s: str) -> str:
+    s = re.sub(r"\s+", " ", html.unescape(s or "")).strip()
+    if s.endswith(("...", "…")):     # el medio ya la recorto
+        s = s.rstrip(". …").strip() + "…"
+    return s if len(s) <= LARGO_RESUMEN else s[:LARGO_RESUMEN].rsplit(" ", 1)[0] + "…"
+
+
+def entradilla(page: str) -> str:
+    """og:description / description del medio; si no, primer parrafo largo."""
+    for rx in _META_DESC:
+        m = rx.search(page)
+        if m and len(m.group(1)) > 60 and not _BASURA.search(m.group(1)):
+            return _corto(m.group(1))
+    for p in re.findall(r"<p\b[^>]*>(.*?)</p>", page, re.DOTALL | re.I):
+        t = re.sub(r"<[^>]+>", " ", p)
+        if len(t.strip()) > 80 and not _BASURA.search(t):
+            return _corto(t)
+    return ""
+
+
+def _resumen_de(n: dict) -> str:
+    """El resumen del RSS si sirve; si no (Google News solo trae el titular),
+    la entradilla de la nota."""
+    r = _corto(n.get("resumen") or "")
+    if "news.google.com" not in n["url"] and len(r) > 60 and not norm(r).startswith(norm(n["titulo"])[:40]):
+        return r
+    import reputacion
+    url = reputacion.url_real(n["url"])
+    if "news.google.com" in url:     # no se pudo decodificar: seria la portada de Google News
+        return ""
+    try:
+        resp = requests.get(url, headers=UA, timeout=20)
+    except Exception:
+        return ""
+    # sin charset en la cabecera requests asume latin-1 (salia "Ã¨" en RSI)
+    if not re.search(r"charset", resp.headers.get("content-type", ""), re.I):
+        resp.encoding = resp.apparent_encoding
+    return entradilla(resp.text)
+
+
+def resumenes(c: sqlite3.Connection, notas: list[dict]) -> None:
+    """Llena n["extracto"]; cachea en la tabla `extractos` (una bajada por nota)."""
+    ya = {r[0]: r[1] for r in c.execute("SELECT url, texto FROM extractos")}
+    faltan = [n for n in notas if n["url"] not in ya]
+    with ThreadPoolExecutor(6) as ex:
+        for n, t in zip(faltan, ex.map(_resumen_de, faltan)):
+            ya[n["url"]] = t
+            c.execute("INSERT OR REPLACE INTO extractos (url, texto) VALUES (?, ?)", (n["url"], t))
+    c.commit()
+    for n in notas:
+        n["extracto"] = ya.get(n["url"], "")
+
+
 def _linea(grupo: list[dict]) -> str:
     n = grupo[0]
     medios = sorted({g["medio"] for g in grupo})
     extra = f"{len(medios)} medios: {', '.join(medios[:5])}{' …' if len(medios) > 5 else ''}" \
         if len(medios) > 1 else medios[0]
-    return f"• <a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a> — <i>{esc(extra)}</i>"
+    linea = f"• <a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a> — <i>{esc(extra)}</i>"
+    # el resumen de cualquier nota del grupo que lo tenga
+    resumen = next((g.get("extracto") for g in grupo if g.get("extracto")), "")
+    return linea + (f"\n   {esc(resumen)}" if resumen else "")
 
 
 def digest(horas: int = 24, enviar: bool = True) -> Path:
@@ -553,19 +647,20 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
     # 2) El sector
     lineas = [f"<b>📰 Monitor farma España — {hoy}</b>"]
     lineas += [""] if menciones else [f"🔕 Hoy sin menciones de LUDA. {balance}", ""]
+    elegidos: dict[str, list[list[dict]]] = {}
     for sec in ORDEN:
         notas_sec = [n for n in notas if n["seccion"] == sec]
-        if not notas_sec:
-            continue
-        lineas.append(f"<b>{ICONO[sec]} {sec}</b>")
         textos = [f"{n['titulo']} {n['resumen'] or ''}" for n in notas_sec]
         grupos: dict[int, list[dict]] = {}
         for n, g in zip(notas_sec, agrupar(textos)):
             grupos.setdefault(g, []).append(n)
         # Las historias con mas medios primero
-        tope = TOPE.get(sec, MAX_POR_SECCION)
-        lineas += [_linea(g) for g in sorted(grupos.values(), key=len, reverse=True)[:tope]]
-        lineas.append("")
+        elegidos[sec] = sorted(grupos.values(), key=len, reverse=True)[:TOPE.get(sec, MAX_POR_SECCION)]
+    # Resumen solo de lo que va al mensaje (no de las ~250 notas del dia)
+    resumenes(c, [n for gs in elegidos.values() for g in gs for n in g[:2]])
+    for sec, gs in elegidos.items():
+        if gs:
+            lineas += [f"<b>{ICONO[sec]} {sec}</b>", *map(_linea, gs), ""]
 
     nuevos = c.execute("SELECT nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
     resueltos = c.execute("SELECT nombre FROM aemps WHERE resuelto_en=?", (hoy,)).fetchall()
@@ -579,6 +674,13 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
     out.parent.mkdir(exist_ok=True)
     out.write_text('<meta charset="utf-8"><body style="white-space:pre-wrap;font-family:sans-serif">'
                    + msg_luda + "\n\n" + texto, encoding="utf-8")
+    if enviar:
+        # Correo diario de LUDA en los medios (a Diego), haya o no menciones
+        try:
+            correo(f"LUDA en los medios — {hoy}",
+                   msg_luda or f"<b>🔔 LUDA EN LOS MEDIOS — {hoy}</b>\n🔕 Sin menciones nuevas en las últimas 24 h.\n{balance}")
+        except Exception as e:      # que un fallo de SMTP no tumbe el Telegram
+            print("correo fallo:", e)
     if enviar and (not msg_luda or telegram(msg_luda)) and telegram(texto):
         c.execute("UPDATE reputacion SET enviada=1 WHERE enviada=0")  # ya salieron en el digest
         c.commit()

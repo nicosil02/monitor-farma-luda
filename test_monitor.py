@@ -29,6 +29,18 @@ def test_temas_y_seccion():
                             "titulo": "Aemps retira un blanqueador dental de venta en Temu"}) is None
 
 
+def test_entradilla():
+    og = ('<meta property="og:description" content="Los problemas de suministro en su división de '
+          'biológicos lastran los ingresos del tercer trimestre de la farmacéutica suiza.">')
+    assert monitor.entradilla(og).startswith("Los problemas de suministro")
+    # sin meta: primer parrafo largo, saltando paginas de error (MarketScreener 2026-10-30)
+    err = "<p>Reference #18.35a162be https://errors.edgesuite.net/18.35a162be.1793331708.7d5524dd</p>"
+    assert monitor.entradilla(err) == ""
+    largo = "<p>" + "palabra " * 80 + "</p>"
+    r = monitor.entradilla(largo)
+    assert r.endswith("…") and len(r) <= monitor.LARGO_RESUMEN + 1
+
+
 def test_telegram_no_corta_recuadros(monkeypatch):
     enviados = []
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")

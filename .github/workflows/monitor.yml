@@ -2,10 +2,10 @@ name: Monitor LUDA
 
 on:
   schedule:
-    # Cada 2 h: alertas de menciones. A las 06 UTC (07 Madrid invierno,
-    # 08 verano) ademas el resumen del dia. El cron nativo a veces se atrasa
-    # (pasa en el Radar): por eso se decide por hora real, no por el cron.
-    - cron: '0 */2 * * *'
+    # Una vez al dia, 06 UTC (07 Madrid invierno, 08 verano): resumen por
+    # Telegram + LUDA en los medios por correo. Antes habia alertas cada 2 h;
+    # se pidio cada 24 h (2026-10-30).
+    - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
       resumen:
@@ -24,6 +24,11 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      # Misma cuenta remitente que monitor-avisos (secret copiado a este repo)
+      GMAIL_USER: ${{ secrets.GMAIL_USER }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}     # repo publico: los correos van como secret
+      EMAIL_CC: ${{ secrets.EMAIL_CC }}
     steps:
       - uses: actions/checkout@v5
 
@@ -57,15 +62,8 @@ jobs:
       - name: Tests
         run: python -m pytest -q
 
-      - name: Alertas (siempre) y resumen (06 UTC)
-        run: |
-          # 07 = la corrida de las 06 que salio atrasada (solo hay horas pares)
-          h=$(date -u +%H)
-          if [ "$h" = "06" ] || [ "$h" = "07" ] || [ "${{ inputs.resumen }}" = "true" ]; then
-            python monitor.py          # fetch + AEMPS + resumen
-          else
-            python monitor.py alertas  # fetch + menciones nuevas
-          fi
+      - name: Resumen del dia (Telegram) y LUDA en los medios (correo)
+        run: python monitor.py
 
       - name: Guardar reporte
         if: always()
