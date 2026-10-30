@@ -1,0 +1,5 @@
+monitor.db
+reportes/
+__pycache__/
+.pytest_cache/
+.env

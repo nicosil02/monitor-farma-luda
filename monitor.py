@@ -1,0 +1,560 @@
+"""Monitor de medios para LUDA Partners (España + Europa).
+
+    python monitor.py           # fetch + aemps + digest (lo de todos los dias)
+    python monitor.py fetch     # baja las fuentes de fuentes.py a monitor.db
+    python monitor.py aemps     # foto del dia de los problemas de suministro (CIMA)
+    python monitor.py digest    # resumen de 24 h por Telegram (+ reportes/AAAA-MM-DD.html)
+    python monitor.py alertas   # fetch + menciones nuevas de LUDA al toque (cada 2 h)
+
+Credenciales en .env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID.
+
+Parser RSS, agrupado de la misma historia y busquedas de Google News vienen
+del Radar Legislativo (Base_legislativa/noticias), sin la parte PE/EC.
+"""
+from __future__ import annotations
+
+import html
+import os
+import re
+import sqlite3
+import sys
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import urlparse
+
+import requests
+
+from fuentes import FUENTES
+
+ROOT = Path(__file__).parent
+DB = ROOT / "monitor.db"
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
+DIAS_FRESCURA = 2     # Google News devuelve notas viejas como si fueran nuevas
+DIAS_OLA = 21         # un informe de LUDA rebota en la prensa ~3 semanas
+UMBRAL_TFIDF = 0.45   # respaldo sin embeddings; mismo valor que historias.py del Radar
+MAX_POR_SECCION = 8   # que el digest se lea en el celular
+
+
+# ---------------------------------------------------------------- texto
+
+def norm(s: str | None) -> str:
+    """Minusculas, sin tildes, espacios simples."""
+    s = "".join(c for c in unicodedata.normalize("NFD", (s or "").lower())
+                if unicodedata.category(c) != "Mn")
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _limpio(s: str) -> str:
+    m = re.match(r"^\s*<!\[CDATA\[(.*?)\]\]>\s*$", s or "", re.DOTALL)
+    # unescape antes de sacar tags: muchos feeds mandan el HTML escapado (&lt;p&gt;)
+    s = re.sub(r"<[^>]+>", " ", html.unescape(m.group(1) if m else (s or "")))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _fecha(s: str) -> str | None:
+    try:
+        dt = parsedate_to_datetime(s)
+    except (TypeError, ValueError):
+        try:
+            dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_ITEM = re.compile(r"<(item|entry)\b[^>]*>(.*?)</\1>", re.DOTALL | re.I)
+
+
+def _tag(item: str, *tags: str) -> str:
+    t = "|".join(tags)
+    m = re.search(rf"<({t})\b[^>]*>(.*?)</\1>", item, re.DOTALL | re.I)
+    return m.group(2) if m else ""
+
+
+def parse_rss(xml: str) -> list[dict]:
+    """RSS 2.0 / Atom -> [{url, titulo, resumen, fecha_pub}]."""
+    out = []
+    for _, item in _ITEM.findall(xml):
+        titulo = _limpio(_tag(item, "title"))
+        link = _limpio(_tag(item, "link"))
+        if not link:  # Atom: <link href="..."/>
+            m = re.search(r'<link[^>]*href=["\']([^"\']+)', item, re.I)
+            link = m.group(1) if m else ""
+        # Google News: el medio real va en <source url="...">
+        src = re.search(r'<source[^>]*url=["\']https?://([^/"\']+)', item, re.I)
+        if titulo and link:
+            out.append({"url": link, "titulo": titulo[:500],
+                        "resumen": _limpio(_tag(item, "description", "summary", "content:encoded"))[:500],
+                        "fecha_pub": _fecha(_limpio(_tag(item, "pubDate", "published", "dc:date", "updated"))),
+                        "dominio": src.group(1).lower() if src else urlparse(link).netloc.lower()})
+    return out
+
+
+def separar_medio(titulo: str) -> tuple[str, str | None]:
+    """Google News: 'Titular - Medio' -> ('Titular', 'Medio')."""
+    t, sep, medio = titulo.rpartition(" - ")
+    return (t, medio) if sep and t and len(medio) < 60 else (titulo, None)
+
+
+# ---------------------------------------------------------------- temas
+
+# Orden = prioridad: la seccion de una nota es su primer tema.
+# Palabras sin tildes; matchean al inicio de palabra (plurales incluidos).
+TEMAS: dict[str, list[str]] = {
+    "Mención LUDA": ["luda partners", "luda trends", "luda farma"],
+    # Reputacion relativa: que se dice de distribuidores y plataformas con
+    # los que LUDA compite o se asocia. ponytail: lista armada desde prensa,
+    # confirmarla con LUDA.
+    "Competencia y socios": [
+        "cofares", "bidafarma", "hefame", "alliance healthcare", "fedefarma", "promofarma",
+        "docmorris", "redcare", "atida", "mifarma", "uber eats", "glovo"],
+    "Desabastecimiento": [
+        "desabastec", "problemas de suministro", "problema de suministro", "falta de medicamento",
+        "faltas de medicamento", "escasez de medicamento", "escasez de farmaco", "rotura de stock",
+        "roturas de stock", "medicamentos en falta", "suministro de medicamento", "sin alternativa terapeutica",
+        "shortage", "penurie", "rupture de stock", "ruptures de stock", "lieferengpass",
+        "lieferengpasse", "carenza", "carenze", "rutura de medicamento"],
+    "Farmacia y distribución": [
+        # sin "farmaceutico/a" suelto: es la persona ("el farmaceutico que
+        # ayudo en el accidente") o la industria, no la botica
+        "farmacia", "oficina de farmacia", "botica", "colegio de farmaceuticos", "cgcof",
+        "sefac", "fefe", "parafarmacia", "receta electronica", "dispensacion", "fedifar",
+        "distribucion farmaceutica", "venta online de medicamentos", "venta a distancia",
+        "farmacia online", "pharmacy", "pharmacies", "pharmacist", "pharmacie",
+        "pharmacien", "apotheke", "farmacie", "farmacisti", "farmacias"],
+    "Regulación": [
+        "aemps", "ley del medicamento", "ley de los medicamentos", "ley de garantias",
+        "precios de referencia", "precio de referencia", "financiacion de medicamentos",
+        "consejo interterritorial", "ministerio de sanidad", "agencia europea del medicamento",
+        "european medicines agency",
+        "critical medicines act", "paquete farmaceutico", "pharmaceutical package",
+        "pharmaceutical legislation", "legislacion farmaceutica"],
+    "Sanidad general": [
+        "medicamento", "farmaco", "medicine", "medicines", "drug", "drugs", "sanidad",
+        "sistema nacional de salud", "atencion primaria", "paciente", "vacuna", "antibiotico",
+        "medicament", "arzneimittel", "farmaci", "medicamentos", "industria farmaceutica",
+        "laboratorio farmaceutico", "laboratorios farmaceuticos", "pharma"],
+}
+_RE_TEMA = {t: re.compile(r"\b(?:" + "|".join(map(re.escape, kws)) + ")", re.I)
+            for t, kws in TEMAS.items()}
+
+# Ruido visto en la primera corrida real (2026-10-29): avisos de empleo UK,
+# oposiciones del BOE.
+_RUIDO = re.compile(r"\bjobs? with\b|\bvacanc|proceso selectivo|concurso-oposicion|\boposicion(?:es)?\b"
+                    r"|libre designacion|\bse nombra\b|\bbolsa de empleo", re.I)
+# Google News con gl=ES igual trae medios de LatAm: por dominio, y por
+# palabras en el titular para los .com latinoamericanos.
+_TLD_FUERA = (".mx", ".ar", ".co", ".cl", ".pe", ".ec", ".br", ".ve", ".uy", ".py", ".bo",
+              ".gt", ".hn", ".sv", ".ni", ".cr", ".pa", ".do", ".cu", ".pr", ".us")
+_LATAM = re.compile(r"\b(?:mexic|argentin|colombia|chile|peru|ecuador|venezuel|paraguay|uruguay|"
+                    r"bolivia|brasil|imss|issste|mendoza|buenos aires|bogota|guatemala|honduras|"
+                    r"costa rica|panama|republica dominicana|puerto rico|estados unidos|eeuu)", re.I)
+
+
+def temas(texto: str) -> list[str]:
+    t = norm(texto)
+    out = [tema for tema, rx in _RE_TEMA.items() if rx.search(t)]
+    # Uber Eats / Glovo solo cuentan si la nota es de farmacia (no riders, no comida)
+    if "Competencia y socios" in out and not re.search(r"\bfarmac|\bparafarmac", t) \
+            and not re.search(r"\b(?:cofares|bidafarma|hefame|alliance healthcare|fedefarma|promofarma|"
+                              r"docmorris|redcare|atida|mifarma)", t):
+        out.remove("Competencia y socios")
+    return out
+
+
+def seccion(n: dict) -> str | None:
+    """Seccion del digest, o None si la nota no va. Mencion > Europa > tema."""
+    if n["bloque"] == "mencion" or "Mención LUDA" in n["temas"]:
+        return "Mención LUDA"
+    if n["region"] == "GLOBAL":
+        return None  # fuera de España/Europa solo interesan las menciones
+    titulo = norm(n.get("titulo"))
+    if _RUIDO.search(titulo) or (n.get("dominio") or "").endswith(_TLD_FUERA) \
+            or (n["region"] == "ES" and _LATAM.search(titulo)):
+        return None
+    if n["filtro"] and not n["temas"]:
+        return None
+    if n["region"] == "EU":
+        # Pharma de negocios (Endpoints: Lilly, BMS) y lo que arrastran las
+        # busquedas de Google (France 24 sobre Ucrania) no; desabastecimiento,
+        # farmacia y regulacion si. EMA/Comision pasan enteras.
+        especifico = set(n["temas"]) - {"Sanidad general"}
+        return "Europa" if especifico or n["bloque"] == "oficial" else None
+    return n["temas"][0] if n["temas"] else "Sanidad general"
+
+
+# ---------------------------------------------------------------- db + fetch
+
+def conectar() -> sqlite3.Connection:
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS noticias (
+            id INTEGER PRIMARY KEY, url TEXT UNIQUE NOT NULL, titulo TEXT, resumen TEXT,
+            fecha_pub TEXT, medio TEXT, dominio TEXT, fuente TEXT, region TEXT, bloque TEXT, filtro INTEGER,
+            first_seen TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+        CREATE TABLE IF NOT EXISTS aemps (
+            cn TEXT PRIMARY KEY, nombre TEXT, tipo INTEGER, fini TEXT, ffin TEXT, observ TEXT,
+            activo INTEGER, visto_desde TEXT, resuelto_en TEXT);
+        CREATE TABLE IF NOT EXISTS reputacion (
+            url TEXT PRIMARY KEY, url_real TEXT, verificada INTEGER, tono TEXT, rol TEXT,
+            riesgo TEXT, resumen TEXT, cita TEXT, enviada INTEGER DEFAULT 0,
+            evaluada_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));""")
+    return c
+
+
+def _bajar(f: dict) -> tuple[dict, list[dict] | str]:
+    try:
+        r = requests.get(f["url"], headers=UA, timeout=25)
+        r.raise_for_status()
+        return f, parse_rss(r.text)
+    except Exception as e:  # una fuente caida no frena las demas
+        return f, f"{type(e).__name__}: {e}"[:200]
+
+
+def fetch() -> None:
+    c = conectar()
+    nuevas, caidas = 0, []
+    with ThreadPoolExecutor(12) as ex:
+        for f, items in ex.map(_bajar, FUENTES):
+            if isinstance(items, str):
+                caidas.append(f"{f['nombre']}: {items}")
+                continue
+            for it in items:
+                titulo, medio = separar_medio(it["titulo"]) if f["google"] else (it["titulo"], f["nombre"])
+                cur = c.execute("""INSERT OR IGNORE INTO noticias
+                    (url, titulo, resumen, fecha_pub, medio, dominio, fuente, region, bloque, filtro)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""", (it["url"], titulo, it["resumen"], it["fecha_pub"],
+                    medio or f["nombre"], it["dominio"], f["nombre"], f["region"], f["bloque"], int(f["filtro"])))
+                nuevas += cur.rowcount
+    c.commit()
+    print(f"fetch: {nuevas} notas nuevas de {len(FUENTES)} fuentes")
+    for x in caidas:
+        print("  caida:", x)
+
+
+# ---------------------------------------------------------------- AEMPS
+
+CIMA = "https://cima.aemps.es/cima/rest/psuministro"
+
+
+def _ms(v) -> str | None:
+    return datetime.fromtimestamp(v / 1000, timezone.utc).date().isoformat() if v else None
+
+
+def bajar_cima() -> list[dict]:
+    out, pagina = [], 1
+    while True:
+        d = requests.get(CIMA, params={"pagina": pagina}, headers=UA, timeout=30).json()
+        out += d["resultados"]
+        if pagina * d["tamanioPagina"] >= d["totalFilas"]:
+            return out
+        pagina += 1
+
+
+def aemps(filas: list[dict] | None = None, hoy: str | None = None) -> tuple[int, int]:
+    """Compara la lista activa de hoy con la guardada. Devuelve (nuevos, resueltos).
+    La primera corrida es la linea base: no cuenta como 'nuevos'."""
+    c = conectar()
+    hoy = hoy or datetime.now(timezone.utc).date().isoformat()
+    filas = bajar_cima() if filas is None else filas
+    base = c.execute("SELECT COUNT(*) FROM aemps").fetchone()[0] == 0
+    activos_antes = {r[0] for r in c.execute("SELECT cn FROM aemps WHERE activo=1")}
+    activos_hoy = {str(f["cn"]) for f in filas if f.get("activo")}
+    for f in filas:
+        cn = str(f["cn"])
+        c.execute("""INSERT INTO aemps (cn, nombre, tipo, fini, ffin, observ, activo, visto_desde)
+                     VALUES (?,?,?,?,?,?,?,?)
+                     ON CONFLICT(cn) DO UPDATE SET nombre=excluded.nombre, tipo=excluded.tipo,
+                       fini=excluded.fini, ffin=excluded.ffin, observ=excluded.observ,
+                       activo=excluded.activo, resuelto_en=NULL,
+                       visto_desde=CASE WHEN aemps.activo=0 THEN excluded.visto_desde ELSE aemps.visto_desde END""",
+                  (cn, f.get("nombre"), f.get("tipoProblemaSuministro"), _ms(f.get("fini")),
+                   _ms(f.get("ffin")), f.get("observ"), int(bool(f.get("activo"))),
+                   "base" if base else hoy))
+    resueltos = activos_antes - activos_hoy
+    c.executemany("UPDATE aemps SET activo=0, resuelto_en=? WHERE cn=?", [(hoy, cn) for cn in resueltos])
+    c.commit()
+    nuevos = 0 if base else len(activos_hoy - activos_antes)
+    print(f"aemps: {len(activos_hoy)} activos, {nuevos} nuevos, {len(resueltos)} resueltos"
+          + (" (linea base)" if base else ""))
+    return nuevos, len(resueltos)
+
+
+# ---------------------------------------------------------------- agrupado
+
+# Embeddings multilingues de Hugging Face (local, ~470 MB, CPU ~5 s para 280
+# notas). Calibrado 2026-10-29 con 280 notas reales: entre medios distintos,
+# desde 0.93 18 de 20 pares eran el mismo hecho (Faes Farma "ingresos +24%" /
+# "gana 74 millones", que TF-IDF no junta); entre 0.91 y 0.93 ya se mezclan
+# hechos distintos del mismo tema (condolencias de COF vs Farmaindustria).
+MODELO_EMB = "intfloat/multilingual-e5-small"
+UMBRAL_EMB = 0.93
+
+
+@lru_cache(maxsize=1)
+def _modelo_emb():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(MODELO_EMB, device="cpu")
+
+
+def similitudes(textos: list[str]):
+    """(matriz, umbral): e5 si esta, si no TF-IDF (sin red / sin torch)."""
+    try:
+        v = _modelo_emb().encode(["query: " + t for t in textos], normalize_embeddings=True, batch_size=64)
+        return v @ v.T, UMBRAL_EMB
+    except Exception as e:
+        print(f"agrupar: sin embeddings ({type(e).__name__}), uso TF-IDF")
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        return cosine_similarity(TfidfVectorizer().fit_transform(textos)), UMBRAL_TFIDF
+
+
+def agrupar(textos: list[str], sims=None, umbral: float | None = None) -> list[int]:
+    """Indice de grupo por texto. Greedy como historias.agrupar del Radar:
+    cada texto entra al primer grupo cuyo representante supera el umbral."""
+    if not textos:
+        return []
+    if sims is None:
+        sims, umbral = similitudes(textos)
+    grupo, reps = [-1] * len(textos), []
+    for i in range(len(textos)):
+        for g, r in enumerate(reps):
+            if sims[i][r] >= umbral:
+                grupo[i] = g
+                break
+        else:
+            grupo[i] = len(reps)
+            reps.append(i)
+    return grupo
+
+
+
+
+# ---------------------------------------------------------------- telegram
+
+def cargar_env(path: Path = ROOT / ".env") -> None:
+    """KEY=valor por linea; lo que ya esta en el entorno manda."""
+    if path.exists():
+        for linea in path.read_text(encoding="utf-8").splitlines():
+            k, sep, v = linea.partition("=")
+            if sep and not k.strip().startswith("#"):
+                os.environ.setdefault(k.strip(), v.strip().strip('"'))
+
+
+def telegram(texto: str) -> bool:
+    """Manda en trozos de <4000 caracteres cortando por linea (limite de
+    Telegram: 4096). Sin TELEGRAM_BOT_TOKEN/CHAT_ID solo avisa."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not (token and chat):
+        print("telegram: falta TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID en .env, no se envia")
+        return False
+    trozos, actual = [], ""
+    for linea in texto.split("\n"):
+        if len(actual) + len(linea) > 3900:
+            trozos.append(actual)
+            actual = ""
+        actual += linea + "\n"
+    trozos.append(actual)
+    ok = True
+    for t in filter(str.strip, trozos):
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", timeout=20,
+                          data={"chat_id": chat, "text": t, "parse_mode": "HTML",
+                                "disable_web_page_preview": "true"})
+        if not r.ok:
+            print("telegram rechazo:", r.text[:200])
+            ok = False
+    return ok
+
+
+# ---------------------------------------------------------------- reputacion
+
+TONO_ICONO = {"positivo": "🟢", "neutro": "⚪", "negativo": "🔴", "sin evaluar": "❔"}
+
+
+def esc(s: str | None) -> str:
+    return html.escape(s or "", quote=True)
+
+
+def _evaluar_pendientes(c: sqlite3.Connection, notas: list[dict]) -> None:
+    import reputacion
+    ya = {r[0] for r in c.execute("SELECT url FROM reputacion")}
+    for n in notas:
+        if n["seccion"] == "Mención LUDA" and n["url"] not in ya:
+            e = reputacion.evaluar(n)
+            c.execute("""INSERT INTO reputacion (url, url_real, verificada, tono, rol, riesgo, resumen, cita)
+                         VALUES (:url, :url_real, :verificada, :tono, :rol, :riesgo, :resumen, :cita)""",
+                      {"url": n["url"], **e})
+            c.commit()
+
+
+def _con_reputacion(c: sqlite3.Connection, notas: list[dict]) -> list[dict]:
+    """Suma la evaluacion a las menciones y saca las que no nombran a LUDA."""
+    rep = {r["url"]: dict(r) for r in c.execute("SELECT * FROM reputacion")}
+    out = []
+    for n in notas:
+        if n["seccion"] == "Mención LUDA":
+            n["rep"] = rep.get(n["url"])
+            if n["rep"] and n["rep"]["verificada"] == 0:
+                continue  # Google la trajo pero LUDA no esta en la nota
+        out.append(n)
+    return out
+
+
+def _mencion(n: dict) -> str:
+    r = n.get("rep") or {}
+    url = r.get("url_real") or n["url"]
+    lineas = [f"{TONO_ICONO.get(r.get('tono'), '❔')} <a href=\"{esc(url)}\">{esc(n['titulo'])}</a>"
+              f" — {esc(n['medio'])}"]
+    det = [x for x in (r.get("rol") and f"LUDA: {r['rol']}", r.get("riesgo") and f"riesgo {r['riesgo']}") if x]
+    if r.get("verificada") is None:
+        det.append("no se pudo leer la nota, verificar")
+    if det:
+        lineas.append(f"   <i>{esc(' · '.join(det))}</i>")
+    if r.get("resumen"):
+        lineas.append(f"   {esc(r['resumen'])}")
+    if r.get("cita"):
+        lineas.append(f"   «{esc(r['cita'][:220])}»")
+    return "\n".join(lineas)
+
+
+def _menciones(notas: list[dict]) -> list[str]:
+    """Una linea para la ola (LUDA citada como fuente neutra: el mismo
+    informe rebotado por 20 medios regionales con titulares distintos) y el
+    detalle solo de las que tienen tono o tratan sobre LUDA."""
+    def rep(n): return n.get("rep") or {}
+    ola = [n for n in notas if rep(n).get("tono") == "neutro" and rep(n).get("rol") == "fuente de datos"]
+    out = [_mencion(n) for n in notas if n not in ola]
+    if ola:
+        links = ", ".join(f"<a href=\"{esc(rep(n).get('url_real') or n['url'])}\">{esc(n['medio'])}</a>" for n in ola)
+        out.append(f"📊 Citada como fuente de datos en {len(ola)} nota(s): {links}")
+    return out
+
+
+def alertas() -> None:
+    """Menciones nuevas de LUDA apenas aparecen (correr cada 2 h, tras fetch).
+    Cada mencion sale una sola vez: aca o en el digest."""
+    c = conectar()
+    notas = [n for n in _notas(c, horas=48) if n["seccion"] == "Mención LUDA"]
+    _evaluar_pendientes(c, notas)
+    enviadas = {r[0] for r in c.execute("SELECT url FROM reputacion WHERE enviada=1")}
+    nuevas = [n for n in _con_reputacion(c, notas) if n["url"] not in enviadas]
+    if not nuevas:
+        print("alertas: sin menciones nuevas")
+        return
+    urgente = any((n.get("rep") or {}).get("riesgo") == "alto" or (n.get("rep") or {}).get("tono") == "negativo"
+                  for n in nuevas)
+    texto = (f"<b>{'🚨 ' if urgente else '📣 '}LUDA en prensa: {len(nuevas)} mención(es) nueva(s)</b>\n\n"
+             + "\n\n".join(_menciones(nuevas)))
+    if telegram(texto):
+        c.executemany("UPDATE reputacion SET enviada=1 WHERE url=?", [(n["url"],) for n in nuevas])
+        c.commit()
+    print(f"alertas: {len(nuevas)} menciones")
+
+
+# ---------------------------------------------------------------- digest
+
+ORDEN = ["Mención LUDA", "Competencia y socios", "Desabastecimiento", "Farmacia y distribución",
+         "Regulación", "Europa", "Sanidad general"]
+ICONO = {"Mención LUDA": "📣", "Competencia y socios": "🏁", "Desabastecimiento": "💊",
+         "Farmacia y distribución": "🏪", "Regulación": "⚖️", "Europa": "🇪🇺", "Sanidad general": "🩺"}
+
+
+def _notas(c: sqlite3.Connection, horas: int) -> list[dict]:
+    ahora = datetime.now(timezone.utc)
+    desde = (ahora - timedelta(hours=horas)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fresca = (ahora - timedelta(days=DIAS_FRESCURA)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    filas = c.execute("""SELECT * FROM noticias WHERE first_seen >= ?
+                         AND (fecha_pub IS NULL OR fecha_pub >= ?)
+                         ORDER BY fecha_pub DESC""", (desde, fresca)).fetchall()
+    vistos, out = set(), []
+    for r in map(dict, filas):
+        clave = norm(r["titulo"])[:80]  # misma nota por RSS y por Google News
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        r["temas"] = temas(f"{r['titulo']} {r['resumen'] or ''}")
+        r["seccion"] = seccion(r)
+        if r["seccion"]:
+            out.append(r)
+    return out
+
+
+def _linea(grupo: list[dict]) -> str:
+    n = grupo[0]
+    medios = sorted({g["medio"] for g in grupo})
+    extra = f"{len(medios)} medios: {', '.join(medios[:5])}{' …' if len(medios) > 5 else ''}" \
+        if len(medios) > 1 else medios[0]
+    return f"• <a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a> — <i>{esc(extra)}</i>"
+
+
+def digest(horas: int = 24, enviar: bool = True) -> Path:
+    c = conectar()
+    notas = _notas(c, horas)
+    _evaluar_pendientes(c, notas)
+    notas = _con_reputacion(c, notas)
+    hoy = datetime.now().date().isoformat()
+    lineas = [f"<b>Monitor de medios LUDA — {hoy}</b>", ""]
+
+    # Reputacion: tono de las menciones de los ultimos DIAS_OLA dias
+    desde_ola = (datetime.now(timezone.utc) - timedelta(days=DIAS_OLA)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tonos = c.execute("""SELECT r.tono, COUNT(*) FROM reputacion r JOIN noticias n ON n.url = r.url
+                         WHERE r.verificada IS NOT 0 AND n.fecha_pub >= ? GROUP BY r.tono""",
+                      (desde_ola,)).fetchall()
+
+    for sec in ORDEN:
+        notas_sec = [n for n in notas if n["seccion"] == sec]
+        if not notas_sec and sec != "Mención LUDA":
+            continue
+        lineas.append(f"<b>{ICONO[sec]} {sec}</b>")
+        if sec == "Mención LUDA":
+            if tonos:
+                lineas.append(f"<i>Últimos {DIAS_OLA} días: "
+                              + " · ".join(f"{TONO_ICONO.get(t, '❔')} {k} {t}" for t, k in tonos) + "</i>")
+            lineas += _menciones(notas_sec) or ["Sin menciones nuevas."]
+            lineas.append("")
+            continue
+        textos = [f"{n['titulo']} {n['resumen'] or ''}" for n in notas_sec]
+        grupos: dict[int, list[dict]] = {}
+        for n, g in zip(notas_sec, agrupar(textos)):
+            grupos.setdefault(g, []).append(n)
+        # Las historias con mas medios primero
+        lineas += [_linea(g) for g in sorted(grupos.values(), key=len, reverse=True)[:MAX_POR_SECCION]]
+        lineas.append("")
+
+    nuevos = c.execute("SELECT nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
+    resueltos = c.execute("SELECT nombre FROM aemps WHERE resuelto_en=?", (hoy,)).fetchall()
+    if nuevos or resueltos:
+        lineas.append(f"<b>🏛️ AEMPS: {len(nuevos)} nuevos problemas de suministro, {len(resueltos)} resueltos</b>")
+        lineas += [f"🔴 {esc(r['nombre'])}" for r in nuevos[:MAX_POR_SECCION]]
+        lineas += [f"🟢 {esc(r['nombre'])}" for r in resueltos[:MAX_POR_SECCION]]
+
+    texto = "\n".join(lineas)
+    out = ROOT / "reportes" / f"{hoy}.html"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text('<meta charset="utf-8"><body style="white-space:pre-wrap;font-family:sans-serif">'
+                   + texto, encoding="utf-8")
+    if enviar and telegram(texto):
+        c.execute("UPDATE reputacion SET enviada=1 WHERE enviada=0")  # ya salieron en el digest
+        c.commit()
+    print(f"digest: {len(notas)} notas -> {out}")
+    return out
+
+
+if __name__ == "__main__":
+    cargar_env()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "todo"
+    if cmd in ("fetch", "todo", "alertas"):
+        fetch()
+    if cmd == "alertas":
+        alertas()
+    if cmd in ("aemps", "todo"):
+        aemps()
+    if cmd in ("digest", "todo"):
+        digest()

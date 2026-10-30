@@ -1,0 +1,77 @@
+name: Monitor LUDA
+
+on:
+  schedule:
+    # Cada 2 h: alertas de menciones. A las 06 UTC (07 Madrid invierno,
+    # 08 verano) ademas el resumen del dia. El cron nativo a veces se atrasa
+    # (pasa en el Radar): por eso se decide por hora real, no por el cron.
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      resumen:
+        description: 'Mandar el resumen del dia ahora'
+        type: boolean
+        default: false
+
+concurrency:
+  group: monitor-luda   # una sola corrida a la vez: comparten monitor.db
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      # Mismo patron que refrescar-pe.yml del Radar: clave nueva por corrida,
+      # se restaura la ultima. Sin esto se pierden la linea base de AEMPS y
+      # el registro de menciones ya enviadas (se repetirian alertas).
+      - name: Base (persiste entre corridas)
+        uses: actions/cache@v5
+        with:
+          path: monitor.db
+          key: monitor-db-${{ github.run_id }}
+          restore-keys: monitor-db-
+
+      - name: Modelo de embeddings (Hugging Face)
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: hf-e5-small
+
+      - name: Dependencias
+        run: |
+          # torch CPU: el de PyPI trae CUDA (~2.5 GB) que aca no sirve
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Alertas (siempre) y resumen (06 UTC)
+        run: |
+          # 07 = la corrida de las 06 que salio atrasada (solo hay horas pares)
+          h=$(date -u +%H)
+          if [ "$h" = "06" ] || [ "$h" = "07" ] || [ "${{ inputs.resumen }}" = "true" ]; then
+            python monitor.py          # fetch + AEMPS + resumen
+          else
+            python monitor.py alertas  # fetch + menciones nuevas
+          fi
+
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-${{ github.run_id }}
+          path: reportes/
+          if-no-files-found: ignore
+          retention-days: 30
