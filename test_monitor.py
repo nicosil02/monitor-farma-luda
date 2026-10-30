@@ -57,9 +57,22 @@ def test_fragmentos_de_la_nota():
     assert reputacion.fragmentos("<p>Nada que ver con la empresa ni con farmacias.</p>") == []
 
 
-def test_agrupar_greedy():
-    sims = [[1, .95, .2], [.95, 1, .2], [.2, .2, 1]]
-    assert monitor.agrupar(["a", "b", "c"], sims, 0.93) == [0, 0, 1]
+def test_agrupar_por_cualquier_miembro():
+    # c se parece a b pero no a a (caso PGEU / Papa): igual va con el grupo
+    sims = [[1, .95, .90, .2], [.95, 1, .94, .2], [.90, .94, 1, .2], [.2, .2, .2, 1]]
+    assert monitor.agrupar(["a", "b", "c", "d"], sims, 0.93) == [0, 0, 0, 1]
+
+
+def test_ruido_institucional_fuera():
+    base = {"bloque": "sector", "region": "ES", "filtro": 0, "temas": ["Farmacia y distribución"]}
+    for t in ["La PGEU traslada a León XIV el compromiso de la farmacia",
+              "El Colegio de Farmacéuticos traslada su profundo pesar por el accidente de Urda",
+              "NUEVA EDICIÓN DE TARDE. AULA DISPENSACIÓN: RECETA ELECTRÓNICA"]:
+        assert monitor.seccion({**base, "titulo": t}) is None, t
+    assert monitor.seccion({**base, "titulo": "Colegio registra denuncias", "dominio": "www.teletica.com"}) is None
+    # "a pesar de" y muertes por falta de farmacos si van
+    assert monitor.seccion({**base, "titulo": "Las farmacias abren a pesar de la huelga"}) == "Farmacia y distribución"
+    assert monitor.seccion({**base, "titulo": "Muere un paciente sin su fármaco en una farmacia"}) == "Farmacia y distribución"
 
 
 def test_tono_es_para_luda_no_para_la_noticia():

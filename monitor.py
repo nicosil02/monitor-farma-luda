@@ -144,14 +144,27 @@ TEMAS: dict[str, list[str]] = {
 _RE_TEMA = {t: re.compile(r"\b(?:" + "|".join(map(re.escape, kws)) + ")", re.I)
             for t, kws in TEMAS.items()}
 
-# Ruido visto en la primera corrida real (2026-10-29): avisos de empleo UK,
-# oposiciones del BOE.
+# Ruido visto en las corridas reales (2026-10-29/30): avisos de empleo UK,
+# oposiciones del BOE, protocolo institucional (audiencia con el Papa,
+# condolencias por el accidente de Urda) y cursos/eventos de los colegios.
+# Sin "muere"/"fallece": "muere un paciente por falta de un farmaco" si va.
 _RUIDO = re.compile(r"\bjobs? with\b|\bvacanc|proceso selectivo|concurso-oposicion|\boposicion(?:es)?\b"
-                    r"|libre designacion|\bse nombra\b|\bbolsa de empleo", re.I)
+                    r"|libre designacion|\bse nombra\b|\bbolsa de empleo"
+                    r"|\bpapa\b|leon xiv|vatican|pontific|condolencia|profundo pesar|pesame|\bluto\b"
+                    r"|accidente (?:ferroviario|de tren|de trafico)|\burda\b"
+                    r"|sesion formativa|edicion de tarde|aula dispensacion|webinar|curso online|jornada formativa",
+                    re.I)
 # Google News con gl=ES igual trae medios de LatAm: por dominio, y por
 # palabras en el titular para los .com latinoamericanos.
 _TLD_FUERA = (".mx", ".ar", ".co", ".cl", ".pe", ".ec", ".br", ".ve", ".uy", ".py", ".bo",
               ".gt", ".hn", ".sv", ".ni", ".cr", ".pa", ".do", ".cu", ".pr", ".us")
+# .com latinoamericanos que se colaron (Teletica CR, Diario Panorama AR) y
+# otros grandes del mismo tipo.
+_DOMINIOS_FUERA = {"teletica.com", "diariopanorama.com", "crhoy.com", "nacion.com", "eltiempo.com",
+                   "elespectador.com", "semana.com", "milenio.com", "eluniverso.com", "listindiario.com",
+                   # sin infobae.com: tiene edicion España en el mismo dominio
+                   "prensalibre.com", "elsalvador.com", "clarin.com", "pagina12.com",
+                   "eldeber.com", "larepublica.co", "biobiochile.com", "emol.com"}
 _LATAM = re.compile(r"\b(?:mexic|argentin|colombia|chile|peru|ecuador|venezuel|paraguay|uruguay|"
                     r"bolivia|brasil|imss|issste|mendoza|buenos aires|bogota|guatemala|honduras|"
                     r"costa rica|panama|republica dominicana|puerto rico|estados unidos|eeuu)", re.I)
@@ -175,7 +188,8 @@ def seccion(n: dict) -> str | None:
     if n["region"] == "GLOBAL":
         return None  # fuera de España/Europa solo interesan las menciones
     titulo = norm(n.get("titulo"))
-    if _RUIDO.search(titulo) or (n.get("dominio") or "").endswith(_TLD_FUERA) \
+    dominio = (n.get("dominio") or "").removeprefix("www.")
+    if _RUIDO.search(titulo) or dominio.endswith(_TLD_FUERA) or dominio in _DOMINIOS_FUERA \
             or (n["region"] == "ES" and _LATAM.search(titulo)):
         return None
     if n["filtro"] and not n["temas"]:
@@ -317,22 +331,30 @@ def similitudes(textos: list[str]):
 
 
 def agrupar(textos: list[str], sims=None, umbral: float | None = None) -> list[int]:
-    """Indice de grupo por texto. Greedy como historias.agrupar del Radar:
-    cada texto entra al primer grupo cuyo representante supera el umbral."""
+    """Indice de grupo por texto: dos notas van juntas si se parecen a
+    CUALQUIER nota del grupo (no solo a la primera, como el greedy del
+    Radar). El greedy dejo partido "La PGEU traslada a Leon XIV..." /
+    "La farmacia europea traslada al Papa..." (2026-10-30): se parecian a
+    traves de una tercera nota. Con 0.93 casi no hay pares falsos, asi que
+    el encadenamiento es seguro."""
     if not textos:
         return []
     if sims is None:
         sims, umbral = similitudes(textos)
-    grupo, reps = [-1] * len(textos), []
+    padre = list(range(len(textos)))
+
+    def raiz(i: int) -> int:
+        while padre[i] != i:
+            padre[i] = padre[padre[i]]
+            i = padre[i]
+        return i
+
     for i in range(len(textos)):
-        for g, r in enumerate(reps):
-            if sims[i][r] >= umbral:
-                grupo[i] = g
-                break
-        else:
-            grupo[i] = len(reps)
-            reps.append(i)
-    return grupo
+        for j in range(i):
+            if sims[i][j] >= umbral:
+                padre[raiz(i)] = raiz(j)
+    ids: dict[int, int] = {}
+    return [ids.setdefault(raiz(i), len(ids)) for i in range(len(textos))]
 
 
 
