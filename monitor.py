@@ -274,7 +274,13 @@ def _ms(v) -> str | None:
 def bajar_cima() -> list[dict]:
     out, pagina = [], 1
     while True:
-        d = requests.get(CIMA, params={"pagina": pagina}, headers=UA, timeout=30).json()
+        for intento in range(3):     # CIMA a veces no responde (2026-10-30)
+            try:
+                d = requests.get(CIMA, params={"pagina": pagina}, headers=UA, timeout=60).json()
+                break
+            except requests.RequestException:
+                if intento == 2:
+                    raise            # nunca devolver una lista a medias: daria falsos "resueltos"
         out += d["resultados"]
         if pagina * d["tamanioPagina"] >= d["totalFilas"]:
             return out
@@ -723,6 +729,9 @@ if __name__ == "__main__":
     if cmd == "alertas":
         alertas()
     if cmd in ("aemps", "todo"):
-        aemps()
+        try:
+            aemps()
+        except Exception as e:   # sin AEMPS hoy, pero el resumen y el correo salen igual
+            print("aemps fallo:", e)
     if cmd in ("digest", "todo"):
         digest()
