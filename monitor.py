@@ -471,8 +471,8 @@ def _mencion(n: dict) -> str:
     det = [x for x in (r.get("rol") and f"LUDA: {r['rol']}", r.get("riesgo") and f"riesgo {r['riesgo']}") if x]
     if r.get("verificada") is None:
         det.append("no se pudo leer la nota, verificar")
-    lineas = [f"<b><a href=\"{esc(url)}\">{esc(n['titulo'])}</a></b>",
-              f"{TONO_ICONO.get(r.get('tono'), '❔')} {esc(n['medio'])}"
+    lineas = [f"<b>{esc(n['titulo'])}</b>",
+              f"{TONO_ICONO.get(r.get('tono'), '❔')} <a href=\"{esc(url)}\">{esc(n['medio'])}</a>"
               + (f" · <i>{esc(' · '.join(det))}</i>" if det else "")]
     if r.get("resumen"):
         lineas.append(esc(r["resumen"]))
@@ -525,6 +525,9 @@ ICONO = {"Competencia y socios": "🏁", "Desabastecimiento": "💊",
 TOPE = {"Europa": 4}   # España primero; Europa solo lo grueso
 
 
+_VIGENTES = {f["nombre"] for f in FUENTES}
+
+
 def _notas(c: sqlite3.Connection, horas: int) -> list[dict]:
     ahora = datetime.now(timezone.utc)
     desde = (ahora - timedelta(hours=horas)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -543,6 +546,8 @@ def _notas(c: sqlite3.Connection, horas: int) -> list[dict]:
         # divulgacion (Finerenona, cambio de hora) caian en Farmacia.
         gn = "news.google.com" in r["url"]
         r["temas"] = temas(r["titulo"] if gn else f"{r['titulo']} {r['resumen'] or ''}")
+        if r["fuente"] not in _VIGENTES:   # fuente ya quitada (ej. busquedas en italiano)
+            continue
         r["seccion"] = seccion(r)
         if r["seccion"]:
             out.append(r)
@@ -626,7 +631,8 @@ def _linea(grupo: list[dict]) -> str:
     medios = sorted({g["medio"] for g in grupo})
     fuente = f"{len(medios)} medios: {', '.join(medios[:4])}{' …' if len(medios) > 4 else ''}" \
         if len(medios) > 1 else medios[0]
-    lineas = [f"<b><a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a></b>", f"📰 {esc(fuente)}"]
+    # Telegram no pone en negrita un link: titular en negrita y el link en el medio
+    lineas = [f"<b>{esc(n['titulo'])}</b>", f"📰 <a href=\"{esc(n['url'])}\">{esc(fuente)}</a>"]
     # el resumen de cualquier nota del grupo que lo tenga
     resumen = next((g.get("extracto") for g in grupo if g.get("extracto")), "")
     if resumen:
