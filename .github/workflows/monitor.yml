@@ -8,8 +8,8 @@ on:
     - cron: '0 6 * * *'
   workflow_dispatch:
     inputs:
-      resumen:
-        description: 'Mandar el resumen del dia ahora'
+      sin_correo:
+        description: 'Prueba: solo Telegram, sin correo a Diego'
         type: boolean
         default: false
 
@@ -27,7 +27,7 @@ jobs:
       # Misma cuenta remitente que monitor-avisos (secret copiado a este repo)
       GMAIL_USER: ${{ secrets.GMAIL_USER }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      EMAIL_TO: ${{ secrets.EMAIL_TO }}     # repo publico: los correos van como secret
+      EMAIL_TO: ${{ !inputs.sin_correo && secrets.EMAIL_TO || '' }}     # repo publico: los correos van como secret
       EMAIL_CC: ${{ secrets.EMAIL_CC }}
     steps:
       - uses: actions/checkout@v5

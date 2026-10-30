@@ -389,7 +389,9 @@ def telegram(texto: str) -> bool:
     # No cortar dentro de un <blockquote>: Telegram rechaza HTML sin cerrar.
     trozos, actual, dentro = [], "", False
     for linea in texto.split("\n"):
-        if len(actual) + len(linea) > 3900 and not dentro:
+        # cortar en linea en blanco (entre notas); a mitad de nota solo si no queda otra
+        largo = len(actual) + len(linea)
+        if not dentro and (largo > 3900 or (largo > 3300 and actual.endswith("\n\n"))):
             trozos.append(actual)
             actual = ""
         actual += linea + "\n"
@@ -617,14 +619,19 @@ def resumenes(c: sqlite3.Connection, notas: list[dict]) -> None:
 
 
 def _linea(grupo: list[dict]) -> str:
+    """Bloque por nota: medio en negrita, titulo con link, entradilla en
+    cursiva, linea en blanco. Antes iba todo seguido y el resumen se pegaba a
+    la nota siguiente: no se entendia de que medio era cada cosa (2026-10-30)."""
     n = grupo[0]
     medios = sorted({g["medio"] for g in grupo})
-    extra = f"{len(medios)} medios: {', '.join(medios[:5])}{' …' if len(medios) > 5 else ''}" \
+    fuente = f"{len(medios)} medios: {', '.join(medios[:4])}{' …' if len(medios) > 4 else ''}" \
         if len(medios) > 1 else medios[0]
-    linea = f"• <a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a> — <i>{esc(extra)}</i>"
+    lineas = [f"📰 <b>{esc(fuente)}</b>", f"<a href=\"{esc(n['url'])}\">{esc(n['titulo'])}</a>"]
     # el resumen de cualquier nota del grupo que lo tenga
     resumen = next((g.get("extracto") for g in grupo if g.get("extracto")), "")
-    return linea + (f"\n   {esc(resumen)}" if resumen else "")
+    if resumen:
+        lineas.append(f"<i>{esc(resumen)}</i>")
+    return "\n".join(lineas) + "\n"
 
 
 def digest(horas: int = 24, enviar: bool = True) -> Path:
@@ -660,7 +667,7 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
     resumenes(c, [n for gs in elegidos.values() for g in gs for n in g[:2]])
     for sec, gs in elegidos.items():
         if gs:
-            lineas += [f"<b>{ICONO[sec]} {sec}</b>", *map(_linea, gs), ""]
+            lineas += [f"<b>{ICONO[sec]} {sec.upper()}</b>", "", *map(_linea, gs), ""]
 
     nuevos = c.execute("SELECT nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
     resueltos = c.execute("SELECT nombre FROM aemps WHERE resuelto_en=?", (hoy,)).fetchall()

@@ -9,7 +9,7 @@ python monitor.py          # 1 vez al dia (mañana de Madrid): resumen por Teleg
 python -m pytest -q
 ```
 
-**En el servidor (sin tu PC):** `.github/workflows/monitor.yml` corre en GitHub Actions a las 06 UTC. Secrets del repo: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GMAIL_USER`, `GMAIL_APP_PASSWORD` (contraseña de aplicación, la misma cuenta de monitor-avisos), `EMAIL_TO`, `EMAIL_CC`. `monitor.db` persiste en el cache de Actions; para mandar el resumen a mano: Actions → Monitor LUDA → Run workflow → resumen.
+**En el servidor (sin tu PC):** `.github/workflows/monitor.yml` corre en GitHub Actions a las 06 UTC. Secrets del repo: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `GMAIL_USER`, `GMAIL_APP_PASSWORD` (contraseña de aplicación, la misma cuenta de monitor-avisos), `EMAIL_TO`, `EMAIL_CC`. `monitor.db` persiste en el cache de Actions; para mandar el resumen a mano: Actions → Monitor LUDA → Run workflow (sin_correo = prueba solo por Telegram).
 
 - `fuentes.py`: ~85 fuentes (RSS + Google News para medios sin RSS o que bloquean bots). Probadas el 2026-10-29.
 - `monitor.py`: descarga, clasifica por tema, junta la misma historia contada por varios medios, arma el resumen y lo manda.
