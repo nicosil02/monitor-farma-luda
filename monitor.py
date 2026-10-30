@@ -696,11 +696,20 @@ def digest(horas: int = 24, enviar: bool = True) -> Path:
 
     nuevos = c.execute("SELECT cn, nombre FROM aemps WHERE visto_desde=? AND activo=1", (hoy,)).fetchall()
     resueltos = c.execute("SELECT cn, nombre FROM aemps WHERE resuelto_en=?", (hoy,)).fetchall()
+    activos = c.execute("SELECT COUNT(*) FROM aemps WHERE activo=1").fetchone()[0]
     if nuevos or resueltos:
-        lineas += [f"<b>🏛️ AEMPS: {len(nuevos)} nuevos problemas de suministro, {len(resueltos)} resueltos</b>",
-                   f"<a href=\"{CIMA_LISTA}\">Listado completo en CIMA</a>", ""]
-        lineas += [f"🔴 <a href=\"{ficha_cima(r['cn'])}\">{esc(r['nombre'])}</a>" for r in nuevos[:MAX_POR_SECCION]]
-        lineas += [f"🟢 <a href=\"{ficha_cima(r['cn'])}\">{esc(r['nombre'])}</a>" for r in resueltos[:MAX_POR_SECCION]]
+        # Explicado para quien no sabe que es la AEMPS (pedido 2026-10-30)
+        lineas += ["<b>🏛️ FALTAS DE MEDICAMENTOS — REGISTRO OFICIAL</b>",
+                   "<i>La AEMPS (Agencia Española de Medicamentos) publica cada día qué medicamentos "
+                   "tienen problemas de suministro en las farmacias. Esto es lo que cambió desde ayer.</i>",
+                   f"<a href=\"{CIMA_LISTA}\">Ver la lista completa</a> ({activos} medicamentos con problemas hoy)", ""]
+        if nuevos:
+            lineas += [f"<b>🔴 Empiezan a faltar ({len(nuevos)})</b>"]
+            lineas += [f"• <a href=\"{ficha_cima(r['cn'])}\">{esc(r['nombre'])}</a>" for r in nuevos[:MAX_POR_SECCION]]
+            lineas.append("")
+        if resueltos:
+            lineas += [f"<b>🟢 Vuelven a estar disponibles ({len(resueltos)})</b>"]
+            lineas += [f"• <a href=\"{ficha_cima(r['cn'])}\">{esc(r['nombre'])}</a>" for r in resueltos[:MAX_POR_SECCION]]
 
     texto = "\n".join(lineas)
     out = ROOT / "reportes" / f"{hoy}.html"
